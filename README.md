@@ -146,7 +146,33 @@ It is possible to inspire Kuni to share past conversations with other people.
 
 ### Windows
 
-Install Ubuntu in WSL and follow Linux instructions.
+Kuni builds and runs **natively on Windows** — WSL is no longer required.
+
+Easiest path (no compiler needed): grab the ready-to-run build from
+[GitHub Actions](../../actions) (artifact `Windows`) or from the release drafts, unpack it, put your `config.toml`
+next to `kuni.exe` and start `start.bat`. The `.bat` wrapper switches the console to UTF-8 and keeps the window open
+so you can read the log and type the login code.
+
+Building from source natively:
+
+```powershell
+# one-time: build tools and tdlib dependencies
+choco install cmake ninja gperf llvm -y
+vcpkg install openssl:x64-windows-static zlib:x64-windows-static
+
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+      -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+      -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+      -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake --build build
+```
+
+Run it from a console (`build\bin\kuni.exe` or `start.bat`) — Kuni is a console application and asks for the phone
+number and the login code on stdin.
+
+Config/prompt hot-reloading works on Windows too (implemented by polling file timestamps once a second).
+
+The WSL route still works if you prefer it: install Ubuntu in WSL and follow the Linux instructions.
 
 ### Ubuntu
 ```bash
@@ -281,6 +307,33 @@ cd build
 
 **Note** on the first run, the program will ask to login to a Telegram account. You should create a new Telegram
 account specifically for your bot (or specify your own account if you are brave enough).
+
+#### Logging in
+
+The login flow is fully interactive and prints exactly what it expects:
+
+```
+[Authentication] state: authorizationStateWaitPhoneNumber
+[Authentication] Enter phone number in international format (e.g. +79001234567):
+[Authentication] where to look for the code: authenticationCodeTypeTelegramMessage
+[Authentication] Enter the login code Telegram has sent you:
+[Authentication] Enter your cloud (2FA) password:        # only if 2FA is enabled
+[Authentication] logged in.
+```
+
+Everything Telegram replies is logged, including rejections (`PHONE_NUMBER_INVALID`, `PHONE_CODE_INVALID`,
+`FLOOD_WAIT_x`, ...), and Kuni re-asks the question instead of going quiet. Email confirmation, registration of a new
+number and QR/other-device confirmation are handled as well.
+
+Troubleshooting:
+
+- **Nothing happens after entering the phone number.** Look for a `[Authentication] ... failed:` line — it names the
+  exact tdlib error. `FLOOD_WAIT_x` means Telegram throttled the number for `x` seconds; wait it out.
+- **Need more detail?** Run with `KUNI_TDLIB_VERBOSITY=3` (or `5` for debug) to get tdlib's own logs — no rebuild
+  required.
+- **Running in Docker?** The container must be interactive (`docker run -it`, or `stdin_open: true` + `tty: true` in
+  `docker-compose.yml`), otherwise stdin is closed and Kuni cannot ask you anything. Kuni logs a warning in that case.
+- **Starting over.** Delete the `tdlib` directory next to the executable to drop the session and log in again.
 
 ### 2. Run Tests (recommended)
 

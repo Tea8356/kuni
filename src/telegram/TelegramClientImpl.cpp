@@ -4,9 +4,13 @@
 
 #include "TelegramClientImpl.h"
 
+#include <cstdlib>
+#include <string>
+
 #include "config.h"
 #include "AUI/Common/ATimer.h"
 #include "AUI/Util/kAUI.h"
+#include "util/ConsoleInput.h"
 
 using namespace std::chrono_literals;
 
@@ -18,7 +22,17 @@ TelegramClientImpl::TelegramClientImpl() : mTgUpdateTimer(_new<ATimer>(1s)) {
     ALOG_TRACE(LOG_TAG) << "TelegramClientImpl::TelegramClientImpl";
     setSlotsCallsOnlyOnMyThread(true);
 
-    td::ClientManager::execute(td::td_api::make_object<td::td_api::setLogVerbosityLevel>(1));
+    // tdlib is very quiet by default which makes login issues impossible to debug. Allow bumping verbosity without a
+    // rebuild: KUNI_TDLIB_VERBOSITY=3 ./kuni (0 = fatal only, 1 = errors, 2 = warnings, 3 = info, 5+ = debug).
+    int tdlibVerbosity = 1;
+    if (const char* env = std::getenv("KUNI_TDLIB_VERBOSITY")) {
+        try {
+            tdlibVerbosity = std::stoi(env);
+        } catch (...) {
+            ALogger::info(LOG_TAG) << "KUNI_TDLIB_VERBOSITY is not a number: " << env;
+        }
+    }
+    td::ClientManager::execute(td::td_api::make_object<td::td_api::setLogVerbosityLevel>(tdlibVerbosity));
     initClientManager();
 
     AObject::connect(mTgUpdateTimer->fired, me::update);
@@ -39,6 +53,61 @@ AFuture<ITelegramClient::Object> TelegramClientImpl::sendQuery(td::td_api::objec
     mHandlers.emplace(query_id, [result](Object object) { result.supplyValue(std::move(object)); });
     mClientManager->send(mClientId, query_id, std::move(f));
     co_return co_await result;
+}
+
+void TelegramClientImpl::sendAuthQuery(td::td_api::object_ptr<td::td_api::Function> f, std::string description) {
+    ALOG_TRACE(LOG_TAG) << "sendAuthQuery " << description;
+    auto queryId = ++mCurrentQueryId;
+
+    // NOTE: authorization queries deliberately bypass sendQuery(). sendQuery() is a coroutine whose AFuture used to be
+    // discarded at the call site, so tdlib errors (PHONE_NUMBER_INVALID, PHONE_CODE_INVALID, FLOOD_WAIT, ...) were
+    // silently swallowed and the login just went quiet - see issue #68. Here the result is always reported.
+    mHandlers.emplace(queryId, [this, self = shared_from_this(), description](Object object) {
+        if (object && object->get_id() == td::td_api::error::ID) {
+            auto& error = static_cast<td::td_api::error&>(*object);
+            ALogger::err(LOG_TAG) << "[Authentication] " << description << " failed: " << error.code_ << " "
+                                  << error.message_;
+            if (error.code_ == 400 && mPendingAuthPromptState == 0 && mRetryAuthPrompt) {
+                // bad input (wrong code/password/phone): tdlib does not re-emit the authorization state, so we have to
+                // ask the user again ourselves.
+                auto retry = mRetryAuthPrompt;
+                retry();
+            }
+            return;
+        }
+        ALogger::info(LOG_TAG) << "[Authentication] " << description << " accepted by Telegram.";
+    });
+    mClientManager->send(mClientId, queryId, std::move(f));
+}
+
+void TelegramClientImpl::promptAuth(
+    std::int32_t stateId, std::string prompt, std::function<void(const std::string&)> action) {
+    if (mPendingAuthPromptState == stateId) {
+        // the very same question is already waiting for an answer; don't queue a duplicate.
+        return;
+    }
+    mPendingAuthPromptState = stateId;
+    mRetryAuthPrompt = [this, self = shared_from_this(), stateId, prompt, action] {
+        mPendingAuthPromptState = 0;
+        promptAuth(stateId, prompt, action);
+    };
+
+    ALogger::info(LOG_TAG) << "[Authentication] input required: " << prompt;
+    util::ConsoleInput::inst().requestLine(
+        "[Authentication] " + prompt, [this, self = shared_from_this(), stateId, action](const std::string& value) {
+            if (mPendingAuthPromptState == stateId) {
+                mPendingAuthPromptState = 0;
+            }
+            if (value.empty()) {
+                ALogger::info(LOG_TAG) << "[Authentication] empty input, asking again.";
+                if (mRetryAuthPrompt) {
+                    auto retry = mRetryAuthPrompt;
+                    retry();
+                }
+                return;
+            }
+            action(value);
+        });
 }
 
 void TelegramClientImpl::initClientManager() {
@@ -113,6 +182,9 @@ void TelegramClientImpl::commonHandler(td::tl::unique_ptr<td::td_api::Object> ob
         *objectShared,
         aui::lambda_overloaded {
           [this](td::td_api::updateAuthorizationState& update_authorization_state) {
+              // always report the state: silent authorization stalls are impossible to debug otherwise (see #68).
+              ALogger::info(LOG_TAG) << "[Authentication] state: "
+                                     << td::td_api::to_string(update_authorization_state.authorization_state_);
               td::td_api::downcast_call(
                   *update_authorization_state.authorization_state_,
                   aui::lambda_overloaded {
@@ -127,38 +199,112 @@ void TelegramClientImpl::commonHandler(td::tl::unique_ptr<td::td_api::Object> ob
                         parameters->system_language_code_ = "en";
                         parameters->device_model_ = "Desktop";
                         parameters->application_version_ = AUI_PP_STRINGIZE(AUI_CMAKE_PROJECT_VERSION);
-                        sendQuery(std::move(parameters));
+                        sendAuthQuery(std::move(parameters), "setTdlibParameters");
                     },
                     [this](td::td_api::authorizationStateReady& u) {
                         ALogger::info(LOG_TAG) << "[Authentication] logged in.";
+                        mPendingAuthPromptState = 0;
                         emit loggedIn;
                     },
                     [this](td::td_api::authorizationStateWaitPhoneNumber& s) {
-                        ALogger::info(LOG_TAG) << "[Authentication] required. Please supply phone number to stdin";
+                        promptAuth(
+                            td::td_api::authorizationStateWaitPhoneNumber::ID,
+                            "Enter phone number in international format (e.g. +79001234567): ",
+                            [this](const std::string& value) {
+                                auto params = td::td_api::make_object<td::td_api::setAuthenticationPhoneNumber>();
+                                params->phone_number_ = value;
 
-                        auto params = td::td_api::make_object<td::td_api::setAuthenticationPhoneNumber>();
-                        std::cin >> params->phone_number_;
-                        sendQuery(std::move(params));
+                                // tdlib accepts a null `settings`, but being explicit avoids surprises with newer
+                                // tdlib versions and disables the call-based flows we can't handle headlessly.
+                                auto settings =
+                                    td::td_api::make_object<td::td_api::phoneNumberAuthenticationSettings>();
+                                settings->allow_flash_call_ = false;
+                                settings->allow_missed_call_ = false;
+                                settings->is_current_phone_number_ = false;
+                                settings->allow_sms_retriever_api_ = false;
+                                params->settings_ = std::move(settings);
+
+                                sendAuthQuery(std::move(params), "setAuthenticationPhoneNumber");
+                            });
                     },
                     [this](td::td_api::authorizationStateWaitPassword& s) {
-                        ALogger::info(LOG_TAG)
-                            << "[Authentication] required. Please supply cloud "
-                               "password to stdin";
-
-                        auto params = td::td_api::make_object<td::td_api::checkAuthenticationPassword>();
-                        std::cin >> params->password_;
-                        sendQuery(std::move(params));
+                        if (!s.password_hint_.empty()) {
+                            ALogger::info(LOG_TAG) << "[Authentication] password hint: " << s.password_hint_;
+                        }
+                        promptAuth(
+                            td::td_api::authorizationStateWaitPassword::ID,
+                            "Enter your cloud (2FA) password: ",
+                            [this](const std::string& value) {
+                                auto params = td::td_api::make_object<td::td_api::checkAuthenticationPassword>();
+                                params->password_ = value;
+                                sendAuthQuery(std::move(params), "checkAuthenticationPassword");
+                            });
                     },
                     [this](td::td_api::authorizationStateWaitCode& s) {
+                        if (s.code_info_) {
+                            ALogger::info(LOG_TAG)
+                                << "[Authentication] where to look for the code: "
+                                << td::td_api::to_string(s.code_info_);
+                        }
+                        promptAuth(
+                            td::td_api::authorizationStateWaitCode::ID,
+                            "Enter the login code Telegram has sent you: ",
+                            [this](const std::string& value) {
+                                auto params = td::td_api::make_object<td::td_api::checkAuthenticationCode>();
+                                params->code_ = value;
+                                sendAuthQuery(std::move(params), "checkAuthenticationCode");
+                            });
+                    },
+                    [this](td::td_api::authorizationStateWaitEmailAddress& s) {
+                        promptAuth(
+                            td::td_api::authorizationStateWaitEmailAddress::ID,
+                            "Enter the email address linked to your Telegram account: ",
+                            [this](const std::string& value) {
+                                auto params = td::td_api::make_object<td::td_api::setAuthenticationEmailAddress>();
+                                params->email_address_ = value;
+                                sendAuthQuery(std::move(params), "setAuthenticationEmailAddress");
+                            });
+                    },
+                    [this](td::td_api::authorizationStateWaitEmailCode& s) {
+                        promptAuth(
+                            td::td_api::authorizationStateWaitEmailCode::ID,
+                            "Enter the code sent to your email: ",
+                            [this](const std::string& value) {
+                                auto params = td::td_api::make_object<td::td_api::checkAuthenticationEmailCode>();
+                                params->code_ = td::td_api::make_object<td::td_api::emailAddressAuthenticationCode>(
+                                    value);
+                                sendAuthQuery(std::move(params), "checkAuthenticationEmailCode");
+                            });
+                    },
+                    [this](td::td_api::authorizationStateWaitOtherDeviceConfirmation& s) {
                         ALogger::info(LOG_TAG)
-                            << "[Authentication] required. Please supply "
-                               "verification code to stdin";
-
-                        auto params = td::td_api::make_object<td::td_api::checkAuthenticationCode>();
-                        std::cin >> params->code_;
-                        sendQuery(std::move(params));
+                            << "[Authentication] Telegram requires confirmation from another device. Open Telegram on "
+                               "your phone -> Settings -> Devices -> Link Desktop Device and scan this link as a QR "
+                               "code: "
+                            << s.link_;
+                    },
+                    [this](td::td_api::authorizationStateWaitRegistration& s) {
+                        promptAuth(
+                            td::td_api::authorizationStateWaitRegistration::ID,
+                            "This phone number is not registered in Telegram. Enter first name (or Ctrl+C to abort): ",
+                            [this](const std::string& firstName) {
+                                util::ConsoleInput::inst().requestLine(
+                                    "[Authentication] Enter last name (may be empty): ",
+                                    [this, firstName](const std::string& lastName) {
+                                        auto params = td::td_api::make_object<td::td_api::registerUser>();
+                                        params->first_name_ = firstName;
+                                        params->last_name_ = lastName;
+                                        sendAuthQuery(std::move(params), "registerUser");
+                                    });
+                            });
+                    },
+                    [this](td::td_api::authorizationStateLoggingOut& u) {
+                        ALogger::info(LOG_TAG) << "[Authentication] logging out...";
+                        mPendingAuthPromptState = 0;
                     },
                     [this](td::td_api::authorizationStateClosed& u) {
+                        ALogger::info(LOG_TAG) << "[Authentication] session closed, restarting tdlib client...";
+                        mPendingAuthPromptState = 0;
                         getThread()->enqueue([this, self = shared_from_this()] { initClientManager(); });
                     },
                     [this](auto& v) { ALogger::info(LOG_TAG) << "Stub: " << td::td_api::to_string(v); },

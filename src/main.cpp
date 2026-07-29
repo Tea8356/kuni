@@ -16,6 +16,7 @@
 #include "AUI/Util/ASharedRaiiHelper.h"
 #include "AUI/Util/kAUI.h"
 #include "AppBase.h"
+#include "util/ConsoleInput.h"
 #include "IChatHistoryMessageProcessor.h"
 #include "ImageGenerator.h"
 #include "AUI/Image/jpg/JpgImageLoader.h"
@@ -781,12 +782,11 @@ AUI_ENTRY {
             prometheus = prometheus::setup(app->metricBreadcumbs());
             prometheus->registerOpenAI(*openAI);
             prometheus->registerAppBase(*app);
-            _new<AThread>([] {
-                ALogger::info(LOG_TAG) << "Bot is up and running. Press enter to shutdown gracefully.";
-                std::cin.get();
-                ALogger::info(LOG_TAG) << "Bot is shutting down. Please give some time to dump remaining context";
-                gEventLoop.stop();
-            })->start();
+            util::ConsoleInput::inst().requestLine(
+                "Bot is up and running. Press enter to shutdown gracefully.\n", [](const std::string&) {
+                    ALogger::info(LOG_TAG) << "Bot is shutting down. Please give some time to dump remaining context";
+                    gEventLoop.stop();
+                });
         });
     } else {
         auto openAI = _new<OpenAIChatMeasurable>(std::make_unique<OpenAIChatImpl>());
@@ -807,12 +807,11 @@ AUI_ENTRY {
         auto dummyBreadcrumbs = _new<MetricsBreadcumbs>();
         prometheus = prometheus::setup(dummyBreadcrumbs);
         prometheus->registerOpenAI(*openAI);
-        _new<AThread>([] {
-            ALogger::info(LOG_TAG) << "Bot is up and running. Press enter to shutdown gracefully.";
-            std::cin.get();
-            ALogger::info(LOG_TAG) << "Bot is shutting down. Please give some time to dump remaining context";
-            gEventLoop.stop();
-        })->start();
+        util::ConsoleInput::inst().requestLine(
+            "Bot is up and running. Press enter to shutdown gracefully.\n", [](const std::string&) {
+                ALogger::info(LOG_TAG) << "Bot is shutting down. Please give some time to dump remaining context";
+                gEventLoop.stop();
+            });
     }
 
     IEventLoop::Handle h(&gEventLoop);
