@@ -83,8 +83,30 @@ if (APPLE)
     target_link_libraries(${PROJECT_NAME} PUBLIC "-framework CoreServices")
 endif()
 
+if (WIN32)
+    # Kuni is an interactive console application: the Telegram login asks for the phone number and the code on stdin.
+    # Without this, the Windows build would be linked as a GUI subsystem app and the console would not be attached.
+    set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE OFF)
+endif()
+
 aui_compile_assets(${PROJECT_NAME})
 aui_enable_tests(${PROJECT_NAME})
+
+if (MSVC)
+    foreach(_kuni_target ${PROJECT_NAME} Tests)
+        if (TARGET ${_kuni_target})
+            # /utf-8          - sources and literals are UTF-8 (prompts and logs contain non-ASCII text)
+            # /bigobj         - main.cpp and the tdlib headers blow past the default section limit
+            # /Zc:preprocessor- conformant preprocessor, required by AUI_PP_* macros
+            target_compile_options(${_kuni_target} PRIVATE /utf-8 /bigobj /Zc:preprocessor /EHsc)
+            target_compile_definitions(${_kuni_target} PRIVATE
+                    NOMINMAX
+                    WIN32_LEAN_AND_MEAN
+                    _CRT_SECURE_NO_WARNINGS
+                    _WIN32_WINNT=0x0A00)
+        endif()
+    endforeach()
+endif()
 
 # Setup icon, display name, etc
 aui_app(TARGET ${PROJECT_NAME}
