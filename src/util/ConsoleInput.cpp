@@ -6,7 +6,7 @@
 #include <mutex>
 #include <thread>
 
-#include "AUI/Common/ALogger.h"
+#include "AUI/Logging/ALogger.h"
 #include "AUI/Thread/AThread.h"
 
 #ifdef _WIN32
